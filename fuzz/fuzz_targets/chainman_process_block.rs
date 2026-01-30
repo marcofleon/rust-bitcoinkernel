@@ -1,10 +1,7 @@
-#![no_main]
-
 use std::sync::{Arc, Once};
 
-use libfuzzer_sys::fuzz_target;
-
-use arbitrary::Arbitrary;
+use afl::fuzz;
+use arbitrary::{Arbitrary, Unstructured};
 
 use bitcoinkernel::{
     disable_logging, prelude::*, Block, BlockValidationStateRef, ChainType,
@@ -63,72 +60,80 @@ pub struct ChainstateManagerInput {
 
 static INIT: Once = Once::new();
 
-fuzz_target!(|data: ChainstateManagerInput| {
-    INIT.call_once(|| {
-        disable_logging();
-    });
-
-    let context = create_context(data.chain_type.into());
-    // Sanitize the input string by removing dots and slashes
-    let sanitized_string: String = data
-        .data_dir
-        .chars()
-        .filter(|c| *c != '.' && *c != '/')
-        .take(60)
-        .collect();
-
-    let data_dir = format!(
-        "/tmp/rust_kernel_fuzz/{}{}",
-        sanitized_string,
-        std::process::id()
-    );
-    let blocks_dir = format!("{}/blocks", data_dir);
-
-    let chainman_builder = match ChainstateManagerBuilder::new(&context, &data_dir, &blocks_dir) {
-        Ok(builder) => builder,
-        Err(KernelError::CStringCreationFailed(_)) => {
-            let _ = std::fs::remove_dir_all(data_dir);
+fn main() {
+    fuzz!(|raw_data: &[u8]| {
+        let mut unstructured = Unstructured::new(raw_data);
+        let Ok(data) = ChainstateManagerInput::arbitrary(&mut unstructured) else {
             return;
-        }
-        Err(err) => panic!("this should never happen: {}", err),
-    };
-
-    let chainman_builder =
-        match chainman_builder.wipe_db(data.wipe_block_index, data.wipe_chainstate_index) {
-            Ok(builder) => builder,
-            Err(KernelError::InvalidOptions(_)) => {
-                let _ = std::fs::remove_dir_all(data_dir);
-                return;
-            }
-            Err(err) => panic!("this should never happen: {}", err),
         };
 
-    let chainman_builder = chainman_builder
-        .block_tree_db_in_memory(data.block_tree_db_in_memory)
-        .chainstate_db_in_memory(data.chainstate_db_in_memory)
-        .worker_threads(data.worker_threads);
+        INIT.call_once(|| {
+            disable_logging();
+        });
 
-    let chainman = match chainman_builder.build() {
-        Err(KernelError::Internal(_)) => {
-            return;
-        }
-        Err(err) => {
-            let _ = std::fs::remove_dir_all(data_dir);
+        let context = create_context(data.chain_type.into());
+        // Sanitize the input string by removing dots and slashes
+        let sanitized_string: String = data
+            .data_dir
+            .chars()
+            .filter(|c| *c != '.' && *c != '/')
+            .take(60)
+            .collect();
+
+        let data_dir = format!(
+            "/tmp/rust_kernel_fuzz/{}{}",
+            sanitized_string,
+            std::process::id()
+        );
+        let blocks_dir = format!("{}/blocks", data_dir);
+
+        let chainman_builder =
+            match ChainstateManagerBuilder::new(&context, &data_dir, &blocks_dir) {
+                Ok(builder) => builder,
+                Err(KernelError::CStringCreationFailed(_)) => {
+                    let _ = std::fs::remove_dir_all(&data_dir);
+                    return;
+                }
+                Err(err) => panic!("this should never happen: {}", err),
+            };
+
+        let chainman_builder =
+            match chainman_builder.wipe_db(data.wipe_block_index, data.wipe_chainstate_index) {
+                Ok(builder) => builder,
+                Err(KernelError::InvalidOptions(_)) => {
+                    let _ = std::fs::remove_dir_all(&data_dir);
+                    return;
+                }
+                Err(err) => panic!("this should never happen: {}", err),
+            };
+
+        let chainman_builder = chainman_builder
+            .block_tree_db_in_memory(data.block_tree_db_in_memory)
+            .chainstate_db_in_memory(data.chainstate_db_in_memory)
+            .worker_threads(data.worker_threads);
+
+        let chainman = match chainman_builder.build() {
+            Err(KernelError::Internal(_)) => {
+                return;
+            }
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&data_dir);
+                panic!("this should never happen: {}", err);
+            }
+            Ok(chainman) => chainman,
+        };
+
+        if let Err(err) = chainman.import_blocks() {
+            let _ = std::fs::remove_dir_all(&data_dir);
             panic!("this should never happen: {}", err);
         }
-        Ok(chainman) => chainman,
-    };
 
-    if let Err(err) = chainman.import_blocks() {
-        let _ = std::fs::remove_dir_all(data_dir);
-        panic!("this should never happen: {}", err);
-    }
-
-    for block in data.blocks {
-        if let Ok(block) = Block::try_from(block.as_slice()) {
-            let _ = chainman.process_block(&block);
+        for block in data.blocks {
+            if let Ok(block) = Block::try_from(block.as_slice()) {
+                let _ = chainman.process_block(&block);
+            }
         }
-    }
-    drop(chainman);
-    let _ = std::fs::remove_dir_all(data_dir);
-});
+        drop(chainman);
+        let _ = std::fs::remove_dir_all(&data_dir);
+    });
+}

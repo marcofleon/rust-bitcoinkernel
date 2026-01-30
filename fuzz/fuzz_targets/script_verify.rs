@@ -1,7 +1,5 @@
-#![no_main]
-
-use arbitrary::Arbitrary;
-use libfuzzer_sys::fuzz_target;
+use afl::fuzz;
+use arbitrary::{Arbitrary, Unstructured};
 
 use bitcoinkernel::{
     verify, KernelError, PrecomputedTransactionData, ScriptPubkey, ScriptVerifyError, Transaction,
@@ -24,43 +22,51 @@ pub struct VerifyInput {
     pub spent_outputs: Vec<UtxoWrapper>,
 }
 
-fuzz_target!(|data: VerifyInput| {
-    // Call the verify function with the fuzzed inputs
-    let spent_outputs: Vec<TxOut> = data
-        .spent_outputs
-        .iter()
-        .map(|utxo| {
-            let script_pubkey = ScriptPubkey::try_from(utxo.script_pubkey.as_slice()).unwrap();
-            TxOut::new(&script_pubkey, utxo.value)
-        })
-        .collect();
+fn main() {
+    fuzz!(|raw_data: &[u8]| {
+        let mut unstructured = Unstructured::new(raw_data);
+        let Ok(data) = VerifyInput::arbitrary(&mut unstructured) else {
+            return;
+        };
 
-    let script_pubkey = ScriptPubkey::try_from(data.script_pubkey.as_slice()).unwrap();
-    let transaction = if let Ok(res) = Transaction::try_from(data.tx_to.as_slice()) {
-        res
-    } else {
-        return;
-    };
+        // Call the verify function with the fuzzed inputs
+        let spent_outputs: Vec<TxOut> = data
+            .spent_outputs
+            .iter()
+            .map(|utxo| {
+                let script_pubkey = ScriptPubkey::try_from(utxo.script_pubkey.as_slice()).unwrap();
+                TxOut::new(&script_pubkey, utxo.value)
+            })
+            .collect();
 
-    let tx_data = if let Ok(res) = PrecomputedTransactionData::new(&transaction, &spent_outputs) {
-        res
-    } else {
-        return;
-    };
+        let script_pubkey = ScriptPubkey::try_from(data.script_pubkey.as_slice()).unwrap();
+        let transaction = if let Ok(res) = Transaction::try_from(data.tx_to.as_slice()) {
+            res
+        } else {
+            return;
+        };
 
-    let res = verify(
-        &script_pubkey,
-        data.amount,
-        &transaction,
-        data.input_index,
-        data.flags,
-        &tx_data,
-    );
+        let tx_data =
+            if let Ok(res) = PrecomputedTransactionData::new(&transaction, &spent_outputs) {
+                res
+            } else {
+                return;
+            };
 
-    match res {
-        Err(KernelError::ScriptVerify(ScriptVerifyError::InvalidFlagsCombination)) => {
-            assert_eq!(data.flags.unwrap() & VERIFY_WITNESS, VERIFY_WITNESS)
+        let res = verify(
+            &script_pubkey,
+            data.amount,
+            &transaction,
+            data.input_index,
+            data.flags,
+            &tx_data,
+        );
+
+        match res {
+            Err(KernelError::ScriptVerify(ScriptVerifyError::InvalidFlagsCombination)) => {
+                assert_eq!(data.flags.unwrap() & VERIFY_WITNESS, VERIFY_WITNESS)
+            }
+            _ => {}
         }
-        _ => {}
-    }
-});
+    });
+}
